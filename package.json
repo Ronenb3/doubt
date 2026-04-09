@@ -1,0 +1,54 @@
+{
+  "name": "doubt",
+  "version": "0.1.0",
+  "description": "Claim verification engine with epistemic self-awareness. 82 free data sources, Bayesian inference, contradiction detection, keystone fragility analysis, and an AI that can't hallucinate confidence it hasn't earned.",
+  "type": "module",
+  "bin": {
+    "doubt": "./bin/doubt.js"
+  },
+  "main": "./src/core/pipeline.js",
+  "exports": {
+    ".": "./src/core/pipeline.js",
+    "./connectors": "./src/connectors/registry.js",
+    "./inference": "./src/inference/bayesian.js",
+    "./epistemic": "./src/epistemic/vectors.js",
+    "./fragility": "./src/fragility/keystone.js",
+    "./mcp": "./src/mcp/server.js"
+  },
+  "scripts": {
+    "start": "node src/mcp/server.js",
+    "investigate": "node bin/doubt.js investigate",
+    "sweep": "node bin/doubt.js sweep",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:unit": "vitest run tests/unit/",
+    "test:integration": "vitest run tests/integration/",
+    "lint": "eslint src/"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "osint",
+    "investigation",
+    "claim-verification",
+    "bayesian-inference",
+    "epistemic",
+    "contradiction-detection",
+    "mcp",
+    "cursor",
+    "fragility",
+    "keystone-beliefs"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ronenb3/doubt"
+  },
+  "dependencies": {
+    "undici": "^7.22.0"
+  },
+  "devDependencies": {
+    "vitest": "^4.0.18"
+  }
+}

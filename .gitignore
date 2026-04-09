@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Environment — copy .env.example to .env and fill in your keys
+.env
+
+# Investigation history — local only, never publish
+.doubt/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Runtime
+*.pid
+
+# Backup files
+*.bak
+*.orig
+*.tmp
