@@ -161,7 +161,7 @@ export class LLMClaimDecomposer {
     this._llmCfg = config.llm || {};
     this._ollamaUrl = this._llmCfg.endpoint || 'http://localhost:11434';
     this._ollamaModel = this._llmCfg.model || 'llama3';
-    this._ollamaAvailable = null;
+    this._ollamaAvailable = (!!this._llmCfg.enabled && this._llmCfg.enabled !== 'false') ? null : false;
     this._timeout = 30_000;
   }
 

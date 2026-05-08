@@ -338,6 +338,7 @@ export class EpistemicCascadeEngine {
   constructor() {
     const config = getConfig();
     this._llmCfg = config.llm || {};
+    this._llmEnabled = !!this._llmCfg.enabled && this._llmCfg.enabled !== 'false';
     this._ollamaUrl = this._llmCfg.endpoint || 'http://localhost:11434';
     this._ollamaModel = this._llmCfg.model || 'llama3';
   }
@@ -449,6 +450,7 @@ export class EpistemicCascadeEngine {
 
   async _inferEdgesLLM(claims, query) {
     try {
+      if (!this._llmEnabled) return [];
       const config = getConfig();
       const ollamaUrl = this._ollamaUrl;
 

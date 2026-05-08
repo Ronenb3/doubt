@@ -1,5 +1,5 @@
 // TikTalk creator discourse connector
-// Queries 391 creators, 12,350 transcripts, 856K words via FAISS semantic search
+// Queries the local TikTalk creator transcript corpus via semantic search.
 // Trust tier: SOCIAL_MEDIA (0.30) — creator commentary, not primary sources
 // Returns what thought leaders / content creators are saying about a topic
 
@@ -11,7 +11,7 @@ class TikTalkConnector extends BaseConnector {
     super({
       id: 'tiktalk',
       name: 'TikTalk Creator Corpus',
-      description: '391 creator accounts, 856K words of transcript — what content creators are saying',
+      description: 'Local creator transcript corpus — what content creators are saying',
       baseUrl: 'http://127.0.0.1:8000',
       domains: ['social', 'news', 'general', 'health', 'financial', 'tech'],
       trustTier: SourceTrust.SOCIAL_MEDIA,

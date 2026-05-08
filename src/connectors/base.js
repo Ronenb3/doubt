@@ -30,6 +30,7 @@ export class BaseConnector {
     rateMs = 1000,
     requiresKey = false,
     keyName = null,
+    skipPrecheck = false,
   }) {
     this.id = id;
     this.name = name;
@@ -40,6 +41,7 @@ export class BaseConnector {
     this.rateMs = rateMs;
     this.requiresKey = requiresKey;
     this.keyName = keyName;
+    this.skipPrecheck = skipPrecheck;
     this._cache = new Map();
   }
 

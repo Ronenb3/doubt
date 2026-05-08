@@ -176,6 +176,9 @@ export class Pipeline {
       this.epistemic.update(inv);
 
       // ── HUNT (intelligent multi-round search) ─────
+      // Precheck connectors once per session — marks dead connectors unavailable
+      // so we don't waste concurrency slots on unreachable endpoints.
+      await registry.precheck({ timeout: 6000 }).catch(() => {});
       inv.phase = Phase.HUNT;
       this.epistemic.setPhase('hunt');
 
@@ -225,9 +228,16 @@ export class Pipeline {
         const fbTotal = Object.values(feedbackQueries).reduce((s, q) => s + q.length, 0);
         this._progress(inv, `[feedback] Generated ${fbTotal} refined queries from round 1 findings`);
 
-        // Merge feedback queries into broad round
+        // Merge feedback queries into broad round, but never widen the connector
+        // set beyond --max-sources. Feedback can add queries to known connectors,
+        // not introduce new ones when a cap is set.
         if (broadRound) {
+          const cap = Number.isFinite(options.maxSources) && options.maxSources > 0 ? options.maxSources : null;
+          const allowedConnectors = cap
+            ? new Set(Object.keys(searchPlan.connectorQueries))
+            : null;
           for (const [cid, queries] of Object.entries(feedbackQueries)) {
+            if (allowedConnectors && !allowedConnectors.has(cid)) continue;
             if (!broadRound.connectors[cid]) broadRound.connectors[cid] = [];
             broadRound.connectors[cid].push(...queries);
           }
@@ -556,8 +566,15 @@ export class Pipeline {
   async sweep(query, options = {}) {
     await registry.loadAll();
 
+    const allowedSources = options.sources && options.sources !== 'all'
+      ? (Array.isArray(options.sources) ? options.sources : `${options.sources}`.split(','))
+          .map(source => source.trim())
+          .filter(Boolean)
+      : null;
+
     const connectors = registry.route(query, {
       maxSources: options.maxSources || 15,
+      connectors: allowedSources || undefined,
     });
 
     const config = getConfig();

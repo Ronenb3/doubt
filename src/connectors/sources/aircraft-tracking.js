@@ -14,7 +14,17 @@ class AircraftTrackingConnector extends BaseConnector {
     });
   }
 
+  _isAviationQuery(query) {
+    // Only fire for queries that are genuinely about aircraft:
+    // callsigns (N123AB), ICAO24 hex codes, airline names, flight numbers, or explicit aviation terms.
+    return /\b([A-Z]{1,2}\d{3,4}[A-Z]{0,2}|N\d{3,5}[A-Z]{0,2}|[A-Z]{3}\d{3,4})\b/.test(query.toUpperCase()) ||
+      /\b(airline|aviation|aircraft|flight|callsign|icao|tail\s*number|fuselage|runway|airport|faa|atc)\b/i.test(query);
+  }
+
   async search(query, options = {}) {
+    // Guard: only fire for actual aviation queries — not for company/financial/OSINT investigations
+    if (!this._isAviationQuery(query)) return [];
+
     try {
       const callsign = query.toUpperCase().replace(/\s+/g, '');
       const items = await this._searchByCallsign(callsign, options);

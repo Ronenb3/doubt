@@ -124,11 +124,12 @@ export class RelevanceScorer {
         domainScore * 0.20 +
         specificityScore * 0.20;
 
-      // Authority floor: if a high-authority source mentions ANY query entity,
-      // ensure it passes the relevance threshold. A court case mentioning "Tesla"
-      // should never be dropped.
-      if (HIGH_AUTHORITY_CONNECTORS.has(item.connectorId) && entityScore > 0) {
-        score = Math.max(score, 0.30);
+      // Authority floor: high-authority connectors (SEC EDGAR, court records, federal register)
+      // do their own internal relevance filtering before returning items — anything they return
+      // is already about the subject. Never drop these below threshold.
+      // Use 0.35 floor (well above 0.25 threshold) so borderline check can't re-drop them.
+      if (HIGH_AUTHORITY_CONNECTORS.has(item.connectorId)) {
+        score = Math.max(score, 0.35);
       }
 
       // News source boost: major news outlets get 1.4x multiplier for geopolitical/political/news domains
@@ -176,30 +177,43 @@ export class RelevanceScorer {
 
     const entityNames = this._flattenEntities(entities);
 
-    // ── Catastrophic-drop protection ──────────────────────
-    // If >90% of evidence scores below threshold, the threshold is too strict
-    // for this query/entity combination. Progressively relax it.
+    // ── Drop-rate diagnostic ──────────────────────────────
+    // If >90% of evidence scores below threshold, the CONNECTORS returned noise —
+    // not because our threshold is wrong, but because routing misfired.
+    // Do NOT lower the threshold: that accepts garbage into inference.
+    // Instead: keep high-authority sources regardless, and take top-N from the rest
+    // by score — preserving ranking but capping junk quantity.
     const aboveThreshold = evidence.filter(e => e._relevanceScore >= threshold).length;
     let effectiveThreshold = threshold;
 
     if (evidence.length > 10 && aboveThreshold < evidence.length * 0.10) {
-      // Try progressively lower thresholds
-      for (const fallback of [0.15, 0.10, 0.05, 0.01]) {
-        const count = evidence.filter(e => e._relevanceScore >= fallback).length;
-        if (count >= Math.min(evidence.length * 0.15, 30)) {
-          effectiveThreshold = fallback;
-          log('warn', `Relevance: threshold ${threshold} would drop ${evidence.length - aboveThreshold}/${evidence.length} — relaxed to ${fallback} (keeps ${count})`);
-          break;
-        }
-      }
-      // If even 0.01 keeps nothing, keep the top 20% by score rather than losing everything
-      if (evidence.filter(e => e._relevanceScore >= effectiveThreshold).length === 0) {
-        const sorted = [...evidence].sort((a, b) => b._relevanceScore - a._relevanceScore);
-        const topN = Math.max(10, Math.floor(evidence.length * 0.20));
-        const cutoff = sorted[Math.min(topN - 1, sorted.length - 1)]?._relevanceScore || 0;
-        effectiveThreshold = cutoff;
-        log('warn', `Relevance: all thresholds failed — keeping top ${topN} items (score >= ${cutoff.toFixed(3)})`);
-      }
+      // Separate high-authority sources (always keep if they have any relevance)
+      const authorityKept = evidence.filter(e =>
+        HIGH_AUTHORITY_CONNECTORS.has(e.connectorId) && e._relevanceScore > 0.01
+      );
+      // From the rest, take top-N by score (keep best 20%, min 10)
+      const nonAuthority = evidence.filter(e => !HIGH_AUTHORITY_CONNECTORS.has(e.connectorId));
+      nonAuthority.sort((a, b) => b._relevanceScore - a._relevanceScore);
+      const topN = Math.max(10, Math.floor(nonAuthority.length * 0.20));
+      const topNItems = nonAuthority.slice(0, topN);
+
+      log('warn', `Relevance: threshold ${threshold} would drop ${evidence.length - aboveThreshold}/${evidence.length} — routing noise detected. Keeping ${authorityKept.length} authority + top ${topNItems.length} scored items. Investigation quality may be low.`);
+
+      // Return early with this curated set
+      const kept = [...authorityKept, ...topNItems];
+      const dropped = evidence.filter(e => !kept.includes(e));
+      return {
+        kept,
+        dropped,
+        stats: {
+          total: evidence.length,
+          kept: kept.length,
+          dropped: dropped.length,
+          avgRelevance: kept.reduce((s, e) => s + (e._relevanceScore || 0), 0) / Math.max(1, kept.length),
+          effectiveThreshold: 'routing-noise-mode',
+          topConnectors: [],
+        },
+      };
     }
 
     const kept = [];
@@ -374,6 +388,8 @@ export class RelevanceScorer {
     const parts = [item.summary || ''];
     if (item.data?.title) parts.push(item.data.title);
     if (item.data?.description) parts.push(item.data.description);
+    // entityName is set by EDGAR, OpenCorporates, and other entity-aware connectors
+    if (item.data?.entityName) parts.push(item.data.entityName);
     if (item.sourceUrl) parts.push(item.sourceUrl);
     return parts.join(' ');
   }

@@ -32,13 +32,19 @@ const TICKER_MAP = {
   'moderna': 'MRNA', 'johnson & johnson': 'JNJ', 'jp morgan': 'JPM',
   'goldman sachs': 'GS', 'berkshire': 'BRK-A', 'walmart': 'WMT',
   'exxon': 'XOM', 'chevron': 'CVX', 'coca-cola': 'KO', 'pepsi': 'PEP',
+  // 2025-2026 IPOs and major private companies
+  'coreweave': 'CRWV', 'klarna': null, 'stripe': null, 'databricks': null,
+  'anduril': null, 'cerebras': null, 'groq': null, 'mistral': null,
+  'perplexity': null, 'cursor': null, 'harvey': null, 'scale ai': null,
+  'hugging face': null, 'stability ai': null, 'inflection': null,
+  'character ai': null, 'eleven labs': null, 'elevenlabs': null,
 };
 
 const CIK_MAP = {
   'TSLA': '0001318605', 'AAPL': '0000320193', 'MSFT': '0000789019',
   'GOOGL': '0001652044', 'AMZN': '0001018724', 'META': '0001326801',
   'NVDA': '0001045810', 'NFLX': '0001065280', 'BA': '0000012927',
-  'PFE': '0000078003',
+  'PFE': '0000078003', 'CRWV': '0001769628',
 };
 
 // Domain-specific synonym expansion
@@ -231,10 +237,40 @@ const DOMAIN_CONNECTOR_MAP = {
   creator:      ['tiktalk', 'reddit', 'community', 'youtube_transcript'],  // Creator/influencer content queries
 };
 
+// Base always-include — minimal set that works for every query type
+const ALWAYS_INCLUDE_BASE = new Set([
+  'wikipedia', 'wikidata', 'google_factcheck', 'innernet',
+]);
+
+// Domain-specific always-include additions
+const ALWAYS_INCLUDE_BY_DOMAIN = {
+  financial:   ['sec_edgar', 'deep_sec', 'market_intelligence', 'guardian'],
+  corporate:   ['sec_edgar', 'opencorporates', 'gleif', 'guardian'],
+  geopolitical: ['guardian', 'gdelt', 'rss_news', 'news_intel', 'reddit'],
+  legal:       ['courtlistener', 'guardian', 'news_archive'],
+  technology:  ['hackernews', 'github', 'reddit', 'guardian'],
+  news:        ['guardian', 'rss_news', 'gdelt', 'reddit'],
+  general:     ['wikipedia', 'reddit', 'duckduckgo', 'hackernews', 'news_archive', 'crossref', 'guardian'],
+};
+
+function getAlwaysInclude(domains = []) {
+  const result = new Set(ALWAYS_INCLUDE_BASE);
+  let hasSpecific = false;
+  for (const domain of domains) {
+    const additions = ALWAYS_INCLUDE_BY_DOMAIN[domain];
+    if (additions) { additions.forEach(c => result.add(c)); hasSpecific = true; }
+  }
+  // Fallback: if no domain-specific additions, use general set
+  if (!hasSpecific) {
+    ALWAYS_INCLUDE_BY_DOMAIN.general.forEach(c => result.add(c));
+  }
+  return result;
+}
+
+// Legacy static export used by relevance.js — keep for compatibility
 const ALWAYS_INCLUDE = new Set([
-  'wikipedia', 'reddit', 'media', 'duckduckgo', 'hackernews', 'news_archive', 'crossref',
-  'wikidata', 'guardian', 'google_factcheck',
-  'innernet', // Personal knowledge graph — fast local service, always contributes belief context
+  'wikipedia', 'wikidata', 'google_factcheck', 'innernet',
+  'reddit', 'duckduckgo', 'hackernews', 'news_archive', 'crossref', 'guardian',
 ]);
 
 // Connectors that are injected automatically when recency mode is detected.
@@ -273,15 +309,39 @@ export class QueryPlanner {
       }
     }
 
-    // depth=deep: force-include ALL registered connectors with topic-based queries.
-    // Every connector gets a chance to contribute; the relevance filter will drop noise later.
+    // depth=deep: expand coverage within DETECTED DOMAINS only.
+    // Do NOT fire all 118 connectors — that routes aircraft tracking to GPU cloud queries.
+    // Instead: include all connectors whose domains overlap with what we detected.
     if (options.depth === 'deep') {
       const topicQueries = extracted.topics.length > 1
         ? extracted.topics.slice(0, 5)
         : [query.slice(0, 80)];
-      for (const [connectorId] of Object.entries(CONNECTOR_STRATEGIES)) {
-        if (!connectorQueries[connectorId]) {
-          connectorQueries[connectorId] = topicQueries.slice(0, 2);
+      const deepExpansionConnectors = new Set();
+
+      // Expand within detected domains
+      for (const domain of extracted.domains) {
+        const domainConnectors = DOMAIN_CONNECTOR_MAP[domain] || [];
+        for (const cid of domainConnectors) deepExpansionConnectors.add(cid);
+      }
+
+      // Always expand corporate+financial connectors if any company is mentioned
+      if (extracted.companies.length > 0) {
+        for (const cid of ['sec_edgar', 'sec_xbrl', 'sec_insider', 'deep_sec', 'opencorporates',
+          'gleif', 'open_ownership', 'state_sos', 'courtlistener', 'sam_gov',
+          'federal_procurement', 'compliance', 'regulatory_enforcement', 'dol_enforcement']) {
+          deepExpansionConnectors.add(cid);
+        }
+      }
+
+      // Add news/social expansion for any query
+      for (const cid of ['rss_news', 'guardian', 'gnews', 'searxng', 'brave_news',
+        'gdelt', 'news_intel', 'hackernews', 'reddit']) {
+        deepExpansionConnectors.add(cid);
+      }
+
+      for (const cid of deepExpansionConnectors) {
+        if (!connectorQueries[cid]) {
+          connectorQueries[cid] = topicQueries.slice(0, 2);
         }
       }
     }
@@ -292,6 +352,17 @@ export class QueryPlanner {
         if (!connectorQueries[cid]) {
           connectorQueries[cid] = [query];
         }
+      }
+    }
+
+    // Hard cap on total connectors — respect --max-sources. Feedback/lateral
+    // expansion can otherwise balloon the connector set well past the user's cap.
+    if (Number.isFinite(options.maxSources) && options.maxSources > 0) {
+      const entries = Object.entries(connectorQueries);
+      if (entries.length > options.maxSources) {
+        const kept = entries.slice(0, options.maxSources);
+        connectorQueries = Object.fromEntries(kept);
+        log('info', `maxSources cap: ${entries.length} → ${kept.length} connectors`);
       }
     }
 
@@ -368,7 +439,7 @@ export class QueryPlanner {
 
     // Detect topical domains
     if (/\b(safe(?:ty)?|crash|accident|recall|defect|injury|fatal(?:ity|ities)?|hazard)\b/i.test(q)) result.domains.push('safety');
-    if (/\b(stock|revenue|financ|profit|invest|SEC\b|ticker|IPO|dividend|quarterly\s+earnings|funding|valuation|series\s+[a-z]|capital\s+raise|capitalization|market\s+cap|acquisition|merger|buyout|private\s+equity|vc|venture|round)\b/i.test(q)) result.domains.push('financial');
+    if (/\b(stock|revenue|financ|profit|invest|SEC\b|ticker|IPO|dividend|quarterly\s+earnings|funding|valuation|series\s+[a-z]|capital\s+raise|capitalization|market\s+cap|acquisition|merger|buyout|private\s+equity|vc|venture|round|S-1|prospectus|moat|competitive|market\s+share)\b/i.test(q)) result.domains.push('financial');
     if (/\b(lawsuit|court|legal|ruling|plaintiff|sued|litigation|indictment|settlement)\b/i.test(q)) result.domains.push('legal');
     if (/\b(?:self[- ]driv|autonom|autopilot|FSD|ADAS|driver.?less)/i.test(q)) result.domains.push('autonomous_vehicles');
     if (/\b(drug|pharma|clinical|FDA|vaccine|medical|disease|patient|therapy|diagnosis)\b/i.test(q)) result.domains.push('medical');
@@ -434,6 +505,14 @@ export class QueryPlanner {
     if (/\b(corporate|governance|ownership|board|directors?|CEO|CFO|CTO|subsidiary|parent\s+company|incorporat|shareholder|merger|acquisition|restructur|IPO)\b/i.test(q) ||
         (result.companies.length > 0 && result.domains.includes('financial'))) {
       result.domains.push('corporate');
+    }
+    // Any query mentioning a known company but missing corporate/financial domain → add both.
+    // This catches "CoreWeave has a competitive moat" which has no financial keywords but IS a corporate OSINT query.
+    if (result.companies.length > 0 && !result.domains.includes('corporate')) {
+      result.domains.push('corporate');
+    }
+    if (result.companies.length > 0 && !result.domains.includes('financial')) {
+      result.domains.push('financial');
     }
 
     // Generate topic terms from the query
@@ -720,7 +799,7 @@ export class QueryPlanner {
    * and entities. Prevents sending "Tesla FSD safety" to FINRA/FBI/FDIC/etc.
    */
   _getRelevantConnectors(extracted) {
-    const relevant = new Set(ALWAYS_INCLUDE);
+    const relevant = getAlwaysInclude(extracted.domains);
 
     for (const domain of extracted.domains) {
       const connectors = DOMAIN_CONNECTOR_MAP[domain];

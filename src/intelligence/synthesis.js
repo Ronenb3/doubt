@@ -103,24 +103,32 @@ export class SynthesisEngine {
 
   _extractThemes(evidence, query) {
     const termFreq = new Map();
+    const termWeight = new Map(); // relevance-weighted frequency
     const termEvidence = new Map();
 
     for (const ev of evidence) {
       const text = this._evidenceText(ev);
       const terms = this._significantTerms(text);
+      // Weight evidence contribution by its relevance score — aircraft data scores near 0,
+      // EDGAR filings score high. This prevents garbage connectors from dominating themes.
+      const relevanceWeight = ev._relevanceScore != null ? ev._relevanceScore : 0.5;
+      const trustWeight = ev.trustWeight != null ? ev.trustWeight : 0.5;
+      const itemWeight = (relevanceWeight * 0.6) + (trustWeight * 0.4);
 
       for (const term of terms) {
         termFreq.set(term, (termFreq.get(term) || 0) + 1);
+        termWeight.set(term, (termWeight.get(term) || 0) + itemWeight);
         if (!termEvidence.has(term)) termEvidence.set(term, []);
         termEvidence.get(term).push(ev);
       }
     }
 
-    // Keep terms that appear in at least 3 items or 2% of evidence
+    // Keep terms that appear in at least 3 items or 2% of evidence AND have meaningful weight
     const minAppearances = Math.max(3, Math.ceil(evidence.length * 0.02));
     const significant = [...termFreq.entries()]
       .filter(([, count]) => count >= minAppearances)
-      .sort((a, b) => b[1] - a[1]);
+      // Sort by weighted score, not raw count — prevents low-relevance floods from dominating
+      .sort((a, b) => (termWeight.get(b[0]) || 0) - (termWeight.get(a[0]) || 0));
 
     // Cluster: greedily merge terms that co-occur in >40% of their evidence
     const clusters = [];

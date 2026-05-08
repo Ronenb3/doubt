@@ -113,9 +113,23 @@ function conceptClusters(query, terms) {
   return clusters.length > 0 ? clusters : terms.map(t => [t]);
 }
 
+// Connectors whose evidence warrants relaxed report filtering — they are
+// authoritative primary sources (government filings, court records, federal registers).
+// Their summaries describe the target entity's actual filings, not generic commentary,
+// so they don't need to hit every query adjective ("durable", "moat") to be relevant.
+const HIGH_AUTHORITY_CONNECTORS = new Set([
+  'sec_edgar', 'federal_register', 'court_listener', 'courtlistener',
+  'fec', 'sam_gov', 'patents_google', 'fda_drugs',
+]);
+
 /**
  * Report-level relevance: should a human see this evidence item?
  * Stricter than pipeline relevance — we want ZERO garbage in the report.
+ *
+ * High-authority connectors (SEC EDGAR, court records, federal register) get a
+ * relaxed threshold: if the company/entity name appears, we show it. Their filing
+ * language won't match investigator adjectives like "durable" or "moat", but the
+ * content (customer concentration %, revenue risk factors) IS directly relevant.
  */
 function isReportWorthy(ev, terms, query) {
   const text = clean(ev.summary || ev.title || ev.data?.title || '').toLowerCase();
@@ -124,8 +138,18 @@ function isReportWorthy(ev, terms, query) {
 
   const hits = terms.filter(t => text.includes(t));
 
-  // Require proportionally more hits for longer queries — prevents 2-word coincidences
-  // letting in irrelevant results (e.g. "anxiety + effective" matching dog tryptophan studies).
+  // High-authority connectors: only require 1 specific term (e.g. company name).
+  // SEC 10-K text won't say "durable competitive moat" — it says "customer concentration
+  // risk" and "revenue from largest customer" which IS what we want shown.
+  if (HIGH_AUTHORITY_CONNECTORS.has(ev.connectorId)) {
+    const specificTerms = terms.filter(t => t.length > 5);
+    if (specificTerms.length > 0 && specificTerms.some(t => text.includes(t))) return true;
+    // Fallback: any 1 query term hit for short queries
+    if (terms.length <= 3 && hits.length >= 1) return true;
+  }
+
+  // Standard connectors: require proportionally more hits for longer queries —
+  // prevents 2-word coincidences letting in irrelevant results.
   const need = Math.max(2, Math.ceil(terms.length * 0.4));
   if (hits.length < need) return false;
 

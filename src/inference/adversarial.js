@@ -30,7 +30,7 @@
  */
 
 import { createClaim, ClaimStatus, EvidenceType } from '../core/schema.js';
-import { log } from '../core/config.js';
+import { getConfig, log } from '../core/config.js';
 
 // ─── Inversion Strategies ───────────────────────────────────
 
@@ -84,7 +84,8 @@ export class AdversarialEngine {
       { id: Strategy.TEMPORAL,    generate: this._generateTemporal.bind(this) },
       { id: Strategy.ATTRIBUTION, generate: this._generateAttribution.bind(this) },
     ];
-    this._ollamaAvailable = null; // lazy-check
+    const llmCfg = getConfig().llm || {};
+    this._ollamaAvailable = (!!llmCfg.enabled && llmCfg.enabled !== 'false') ? null : false;
   }
 
   /**

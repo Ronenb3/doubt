@@ -20,15 +20,22 @@ import { mkdirSync, existsSync, writeFileSync } from 'fs';
 
 const args = process.argv.slice(2);
 const command = args[0];
-const query = args[1];
+let query = null;
 
 // Parse flags
 const flags = {};
-for (let i = 2; i < args.length; i++) {
+for (let i = 1; i < args.length; i++) {
   if (args[i].startsWith('--')) {
     const key = args[i].slice(2);
-    flags[key] = args[i + 1] || true;
-    if (typeof flags[key] === 'string') i++;
+    const next = args[i + 1];
+    if (next && !next.startsWith('--')) {
+      flags[key] = next;
+      i++;
+    } else {
+      flags[key] = true;
+    }
+  } else if (query === null) {
+    query = args[i];
   }
 }
 
@@ -103,7 +110,8 @@ async function investigate() {
         lastPhase = event.phase;
       } else {
         const bar = event.status || '';
-        process.stderr.write(`\r  [${event.phase}] ${bar} ${event.message}`.padEnd(100) + '\r');
+        const ts = new Date().toISOString().slice(11, 19);
+        process.stderr.write(`  [${ts}] [${event.phase}] ${bar} ${event.message}\n`);
       }
     },
   });
@@ -118,7 +126,27 @@ async function investigate() {
 
   console.error(`\n  doubt — investigating: "${query}"\n`);
 
-  const investigation = await pipeline.investigate(query, options);
+  // Overall wall-clock timeout — default 600s, override with --timeout <seconds>.
+  // Prevents zombie investigations when an LLM call or connector hangs silently.
+  // Previous 180s was too short: without LLM acceleration, the pipeline takes ~500s
+  // for full investigations (hunt + inference + adversarial + fragility + narrative).
+  const timeoutSec = parseInt(flags.timeout || '600');
+  let partialInv = null;
+  const investigation = await Promise.race([
+    pipeline.investigate(query, options).then(inv => { partialInv = inv; return inv; }),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Pipeline timeout after ${timeoutSec}s`)), timeoutSec * 1000)
+    ),
+  ]).catch(err => {
+    console.error(`\n  ⚠ ${err.message} — returning partial results if available\n`);
+    // Use partial results from pipeline if available (it accumulates evidence on inv object)
+    if (partialInv && partialInv.evidence?.length > 0) {
+      partialInv.status = partialInv.status || 'timeout';
+      partialInv.error = err.message;
+      return partialInv;
+    }
+    return { status: 'timeout', error: err.message, query, claims: [], evidence: [], meta: {} };
+  });
 
   console.error('\n');
 
@@ -154,6 +182,11 @@ async function investigate() {
     writeFileSync(liveFile, JSON.stringify(finalSnap, null, 2));
     console.error(`  Live snapshot: ${liveFile}`);
   }
+
+  // Force exit — when the pipeline timed out or was aborted, outstanding fetches
+  // and keep-alive sockets would otherwise pin the event loop for minutes.
+  // We've written everything we need; it's safe to leave.
+  process.exit(investigation.status === 'timeout' || investigation.status === 'error' ? 2 : 0);
 }
 
 async function sweep() {
@@ -168,6 +201,7 @@ async function sweep() {
 
   const result = await pipeline.sweep(query, {
     maxSources: parseInt(flags['max-sources'] || '15'),
+    sources: flags.sources ? flags.sources.split(',') : 'all',
   });
 
   if (flags.format === 'json') {
@@ -197,9 +231,24 @@ async function sweep() {
 
 async function listConnectors() {
   await registry.loadAll();
+  const includeHealth = !!flags.health || !!flags.live;
+  if (includeHealth) {
+    const timeout = parseInt(flags.timeout || '2000');
+    console.error(`  Running connector health precheck (${timeout}ms timeout)...`);
+    await registry.precheck({ timeout }).catch(() => {});
+  }
   const connectors = registry.all();
 
-  console.log(`\n  doubt — ${connectors.length} data sources\n`);
+  if (flags.format === 'json') {
+    console.log(JSON.stringify(connectors.map(c => ({
+      ...c.toJSON(),
+      liveStatus: connectorLiveStatus(c, includeHealth),
+    })), null, 2));
+    return;
+  }
+
+  const healthLabel = includeHealth ? ' with live precheck' : '';
+  console.log(`\n  doubt — ${connectors.length} data sources${healthLabel}\n`);
 
   // Group by domain
   const byDomain = {};
@@ -213,11 +262,24 @@ async function listConnectors() {
   for (const [domain, items] of Object.entries(byDomain).sort()) {
     console.log(`  ${domain.toUpperCase()}`);
     for (const c of items) {
-      const status = c.available ? '✅' : '🔑';
+      const status = connectorStatusIcon(c, includeHealth);
       console.log(`    ${status} ${c.id.padEnd(20)} ${c.name} (trust: ${c.trustTier})`);
     }
     console.log();
   }
+}
+
+function connectorLiveStatus(connector, includeHealth = false) {
+  if (!connector.available) return 'missing_key';
+  if (includeHealth && registry.isDead(connector.id)) return 'unreachable';
+  return includeHealth ? 'online_or_unchecked' : 'not_checked';
+}
+
+function connectorStatusIcon(connector, includeHealth = false) {
+  const status = connectorLiveStatus(connector, includeHealth);
+  if (status === 'missing_key') return '🔑';
+  if (status === 'unreachable') return '❌';
+  return '✅';
 }
 
 async function history() {
@@ -245,7 +307,7 @@ function printUsage() {
   USAGE
     doubt investigate "claim or entity"     Full investigation with triple gate
     doubt sweep "target"                    Quick multi-source OSINT sweep
-    doubt connectors                        List all 82 data sources
+    doubt connectors [--health]             List data sources; optionally precheck live reachability
     doubt history                           View past investigations
 
   FLAGS

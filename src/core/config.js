@@ -15,7 +15,10 @@ const defaults = {
     retries: 1,
     retryDelay: 500,
     maxConcurrent: 12,
-    userAgent: 'doubt/0.1.0 (open-source claim verification; https://github.com/ronenb3/doubt)',
+    userAgent: 'doubt/0.1.0 research-tool contact@doubt.tools',
+    // SEC EDGAR requires a specific User-Agent format: "tool-name contact@email.com"
+    // Using a generic UA gets a 403 "Undeclared Automated Tool" block.
+    secUserAgent: 'doubt-research/1.0 contact@doubt.tools',
   },
 
   // Pipeline settings
@@ -111,7 +114,12 @@ export function getConfig() {
       for (let i = 0; i < path.length - 1; i++) {
         obj = obj[path[i]] = obj[path[i]] || {};
       }
-      obj[path[path.length - 1]] = val;
+      // Coerce boolean/number strings so DOUBT_LLM_ENABLED=false works correctly
+      let coerced = val;
+      if (val === 'true') coerced = true;
+      else if (val === 'false') coerced = false;
+      else if (/^\d+$/.test(val)) coerced = parseInt(val);
+      obj[path[path.length - 1]] = coerced;
     }
   }
 

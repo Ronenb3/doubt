@@ -19,6 +19,8 @@ class ConnectorRegistry {
   constructor() {
     this._connectors = new Map();
     this._loaded = false;
+    this._deadConnectors = new Set();
+    this._precheckDone = false;
   }
 
   async loadAll() {
@@ -52,7 +54,68 @@ class ConnectorRegistry {
   }
 
   available() {
-    return this.all().filter(c => c.available);
+    return this.all().filter(c => c.available && !this._deadConnectors.has(c.id));
+  }
+
+  isDead(id) {
+    return this._deadConnectors.has(id);
+  }
+
+  /**
+   * Run a lightweight health precheck against all connectors.
+   * Marks connectors that consistently fail as unavailable for this session.
+   * Called once before the first investigation — prevents wasting concurrency slots
+   * on connectors that are down, rate-limited, or misconfigured.
+   *
+   * Uses cached results within a session so this only runs once.
+   */
+  async precheck({ timeout = 8000 } = {}) {
+    if (this._precheckDone) return;
+    this._precheckDone = true;
+    this._deadConnectors = this._deadConnectors || new Set();
+
+    const connectors = this.available();
+    // Only precheck connectors that have a baseUrl, are not flagged skipPrecheck,
+    // and don't block HEAD requests (SEC EDGAR, CourtListener, GDELT all return 403/405 on HEAD).
+    const HEAD_BLOCKED_HOSTS = new Set([
+      'efts.sec.gov', 'www.sec.gov', 'courtlistener.com', 'api.gdelt.org',
+      'gdeltproject.org', 'google.com', 'factchecktools.googleapis.com',
+    ]);
+    const checkable = connectors.filter(c => {
+      if (!c.baseUrl || !c.baseUrl.startsWith('http')) return false;
+      if (c.skipPrecheck) return false;
+      try {
+        const host = new URL(c.baseUrl).hostname;
+        if (HEAD_BLOCKED_HOSTS.has(host)) return false;
+      } catch { return false; }
+      return true;
+    });
+
+    const results = await Promise.allSettled(
+      checkable.map(async connector => {
+        try {
+          const res = await fetch(connector.baseUrl, {
+            method: 'HEAD',
+            signal: AbortSignal.timeout(timeout),
+          });
+          return { id: connector.id, ok: res.ok || res.status < 500 };
+        } catch {
+          return { id: connector.id, ok: false };
+        }
+      })
+    );
+
+    let dead = 0;
+    for (const result of results) {
+      if (result.status === 'fulfilled' && !result.value.ok) {
+        this._deadConnectors.add(result.value.id);
+        dead++;
+      }
+    }
+
+    if (dead > 0) {
+      log('info', `Connector precheck: ${dead}/${checkable.length} unreachable — excluded from investigation`);
+    }
   }
 
   /**

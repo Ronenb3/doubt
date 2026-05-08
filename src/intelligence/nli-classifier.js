@@ -75,12 +75,15 @@ export class NLIClassifier {
   constructor() {
     const config = getConfig();
     this._llmCfg = config.llm || {};
+    this._llmEnabled = !!this._llmCfg.enabled && this._llmCfg.enabled !== 'false';
     this._ollamaUrl = this._llmCfg.endpoint || 'http://localhost:11434';
     this._ollamaModel = this._llmCfg.model || 'llama3';
-    this._ollamaAvailable = null; // null = unchecked
+    this._ollamaAvailable = this._llmEnabled ? null : false; // skip LLM probing when disabled
     this._batchSize = 6; // evidence items per LLM call
     this._maxLLMItems = 500; // cap LLM classification to top-N by trust weight
-    this._timeout = 60_000;
+    this._timeout = 15_000; // 15s per batch — if Ollama is slower than this, switch to pattern
+    this._consecutiveTimeouts = 0;
+    this._maxConsecutiveTimeouts = 2; // after 2 consecutive timeouts, abandon LLM for this run
   }
 
   /**
@@ -122,10 +125,21 @@ export class NLIClassifier {
       // Classify top N via LLM in batches
       const llmSlice = sorted.slice(0, this._maxLLMItems);
       const batches = chunk(llmSlice, this._batchSize);
+      this._consecutiveTimeouts = 0;
+      let abandonLLM = false;
 
       for (const batch of batches) {
+        // If too many consecutive timeouts, stop trying LLM and fall through to pattern
+        if (abandonLLM) {
+          for (const e of batch) {
+            if (!e._nliMethod) { this._classifyPattern(e, claim); patternClassified++; }
+          }
+          continue;
+        }
+
         try {
           const results = await this._classifyBatchLLM(batch, claim);
+          this._consecutiveTimeouts = 0; // reset on success
           for (let i = 0; i < batch.length; i++) {
             const r = results[i];
             if (r) {
@@ -137,13 +151,17 @@ export class NLIClassifier {
             }
           }
         } catch (err) {
-          log('warn', `NLI batch failed: ${err.message}`);
-          // Fall through to pattern classification
-          for (const e of batch) {
-            if (!e._nliMethod) {
-              this._classifyPattern(e, claim);
-              patternClassified++;
+          const isTimeout = err.message?.includes('abort') || err.message?.includes('timeout') || err.name === 'AbortError';
+          if (isTimeout) {
+            this._consecutiveTimeouts++;
+            if (this._consecutiveTimeouts >= this._maxConsecutiveTimeouts) {
+              log('warn', `NLI: ${this._consecutiveTimeouts} consecutive timeouts — Ollama too slow, switching to pattern classifier for remainder`);
+              abandonLLM = true;
             }
+          }
+          log('warn', `NLI batch failed: ${err.message}`);
+          for (const e of batch) {
+            if (!e._nliMethod) { this._classifyPattern(e, claim); patternClassified++; }
           }
         }
       }
