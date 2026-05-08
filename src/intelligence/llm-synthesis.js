@@ -13,8 +13,11 @@
  */
 
 import { log, getConfig } from '../core/config.js';
+import { parseLenientJson } from '../core/llm.js';
 
 const TIMEOUT_MS = 60_000;
+const SYNTH_MAX_ATTEMPTS = 2;
+const SYNTH_RETRY_BACKOFF_MS = 1500;
 
 export class LLMSynthesis {
 
@@ -37,16 +40,34 @@ export class LLMSynthesis {
   async synthesize(evidence, claims, query, heuristicSynthesis) {
     if (!this._enabled) return null;
 
+    const prompt = this._buildPrompt(evidence, claims, query, heuristicSynthesis);
+    const start = Date.now();
+
+    // Retry-with-backoff. Deep synthesis is the longest LLM call in the
+    // pipeline and a single 60s timeout shouldn't kill the whole step.
+    let raw = null;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= SYNTH_MAX_ATTEMPTS; attempt++) {
+      try {
+        raw = await this._callProvider(prompt);
+        if (raw) break;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < SYNTH_MAX_ATTEMPTS) {
+          const wait = SYNTH_RETRY_BACKOFF_MS * attempt;
+          log('debug', `llm-synthesis: attempt ${attempt} failed (${err.message}) — retrying in ${wait}ms`);
+          await new Promise(r => setTimeout(r, wait));
+        }
+      }
+    }
+
+    if (!raw) {
+      if (lastErr) log('warn', `llm-synthesis: failed after ${SYNTH_MAX_ATTEMPTS} attempts — ${lastErr.message}`);
+      return null;
+    }
+
     try {
-      const prompt = this._buildPrompt(evidence, claims, query, heuristicSynthesis);
-      const start = Date.now();
-      const raw = await this._callProvider(prompt);
-      const latencyMs = Date.now() - start;
-
-      if (!raw) return null;
-
       const parsed = this._parseResponse(raw);
-
       return {
         available: true,
         patterns: parsed.patterns,
@@ -56,10 +77,10 @@ export class LLMSynthesis {
         confidenceRecommendation: parsed.confidenceRecommendation,
         rawResponse: raw,
         model: this._cfg.model,
-        latencyMs,
+        latencyMs: Date.now() - start,
       };
     } catch (err) {
-      log('warn', `llm-synthesis: failed — ${err.message}`);
+      log('warn', `llm-synthesis: response parse failed — ${err.message}`);
       return null;
     }
   }
@@ -115,11 +136,9 @@ Example format: [3,1,7,2,5,4,6]`;
       const raw = await this._callProvider(prompt);
       if (!raw) return facts;
 
-      // Parse the JSON array from the response
-      const match = raw.match(/\[[\d,\s]+\]/);
-      if (!match) return facts;
-
-      const order = JSON.parse(match[0]);
+      // LLMs frequently emit trailing commas, code-fence wrappers, or
+      // leading prose. Use the lenient parser instead of strict JSON.
+      const order = parseLenientJson(raw);
       if (!Array.isArray(order)) return facts;
 
       // Re-order facts according to LLM ranking
@@ -402,13 +421,23 @@ IMPORTANT: Label each section exactly as shown (e.g., "1. PATTERN ANALYSIS:"). B
 
 // ─── Utilities ──────────────────────────────────────────────────
 
-function fetchWithTimeout(url, options, timeoutMs) {
-  return Promise.race([
-    fetch(url, options),
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`LLM request timed out after ${timeoutMs}ms`)), timeoutMs)
-    ),
-  ]);
+async function fetchWithTimeout(url, options, timeoutMs) {
+  // AbortController so the timeout actually kills the request. The old
+  // Promise.race pattern rejected the caller but left fetch running,
+  // which on a single-slot local model (Ollama) caused dead connections
+  // to pile up and serialise everything behind them.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      throw new Error(`LLM request timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export default LLMSynthesis;

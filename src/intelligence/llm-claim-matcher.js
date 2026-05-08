@@ -1,46 +1,38 @@
 /**
  * doubt — LLM-Powered Evidence-Claim Matcher
  *
- * The old claim-matcher used keyword/entity overlap (Jaccard) to link
- * evidence to claims. This works for simple queries like "Tesla revenue"  
- * but fails catastrophically for complex geopolitical investigations
- * where evidence about "uranium enrichment levels breach NPT" doesn't  
- * share enough keywords with "Iran has been enriching uranium beyond 
- * JCPOA limits."
+ * Semantic claim/evidence linker. The keyword fallback (Jaccard overlap)
+ * works for simple queries like "Tesla revenue" but fails on complex
+ * investigations — "uranium enrichment levels breach NPT" shares almost
+ * no keywords with "Iran exceeds JCPOA limits" even though they're the
+ * same claim.
  *
- * This module uses the local LLM (Ollama) to semantically match evidence 
- * to claims. Given a batch of evidence items and a list of claims, the
- * LLM assigns each evidence item to its most relevant claim with a
- * confidence score.
+ * Uses the shared LLM client (any configured provider — Anthropic / OpenAI
+ * / Ollama / custom). Previously hardcoded Ollama-only, which meant 100%
+ * keyword fallback whenever Ollama wasn't running, even when the rest of
+ * the pipeline was using a cloud model. That asymmetry is fixed now.
  *
- * Falls back to keyword matching when Ollama is unavailable.
+ * Falls back to keyword matching when no provider is reachable.
  */
 
 import { log } from '../core/config.js';
+import { callLLM, isLLMAvailable, parseLenientJson } from '../core/llm.js';
 import ClaimMatcher from './claim-matcher.js';
 
-const OLLAMA_URL = 'http://127.0.0.1:11434/api/generate';
-const MODEL = 'llama3';
-const BATCH_SIZE = 8;  // Evidence items per LLM call
-const TIMEOUT_MS = 45000;
+const BATCH_SIZE = 12;         // Evidence items per LLM call. Bigger = fewer round-trips.
+const PER_BATCH_TIMEOUT_MS = 30000;
+const MAX_STALL_MS = 180000;   // Total LLM time budget. 3min covers slow local models on a typical investigation.
 
 export class LLMClaimMatcher {
   constructor() {
-    this._available = null;
+    this._available = null;    // resolved on first match() call
     this._fallback = new ClaimMatcher();
     this._stats = { llm: 0, fallback: 0, total: 0 };
   }
 
   async _checkAvailable() {
     if (this._available !== null) return this._available;
-    try {
-      const resp = await fetch('http://127.0.0.1:11434/api/tags', {
-        signal: AbortSignal.timeout(3000),
-      });
-      this._available = resp.ok;
-    } catch {
-      this._available = false;
-    }
+    this._available = await isLLMAvailable();
     return this._available;
   }
 
@@ -85,12 +77,26 @@ export class LLMClaimMatcher {
 
     log('info', `LLM claim-matcher: matching ${evidence.length} evidence items to ${claims.length} claims in ${batches.length} batches`);
 
+    const startedAt = Date.now();
+    let bailed = false;
     for (const batch of batches) {
+      if (bailed || Date.now() - startedAt > MAX_STALL_MS) {
+        // Total LLM budget blown — fall every remaining batch to keyword matching.
+        if (!bailed) log('warn', `LLM claim-matcher: ${MAX_STALL_MS}ms budget exceeded, falling remaining batches to keyword`);
+        bailed = true;
+        this._fallback.match(batch, claims);
+        this._stats.fallback += batch.filter(e => e.claimId).length;
+        continue;
+      }
       try {
         await this._matchBatch(batch, claimList, claimSummary);
       } catch (err) {
-        log('debug', `LLM batch failed, falling back: ${err.message}`);
-        // Fallback for this batch
+        // Surface the first batch-level error at warn level so a stuck
+        // pipeline is diagnosable without --verbose. Subsequent failures
+        // stay at debug to avoid log spam when the LLM is just slow.
+        const level = (this._stats.batchFailures || 0) === 0 ? 'warn' : 'debug';
+        this._stats.batchFailures = (this._stats.batchFailures || 0) + 1;
+        log(level, `LLM batch failed, falling back: ${err.message}`);
         this._fallback.match(batch, claims);
         this._stats.fallback += batch.filter(e => e.claimId).length;
       }
@@ -147,23 +153,20 @@ Rules:
 
 Return ONLY the JSON array. No commentary.`;
 
-    const resp = await fetch(OLLAMA_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: MODEL, prompt, stream: false }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+    // No retries: the matcher has its own budget-and-fallback policy, and
+    // doubling per-batch latency would blow the budget instead of helping.
+    // Larger maxTokens because 12 evidence items × ~60 chars output per
+    // assignment object needs headroom.
+    const raw = await callLLM(prompt, {
+      timeoutMs: PER_BATCH_TIMEOUT_MS,
+      retries: 0,
+      maxTokens: 1200,
+      temperature: 0.1,
     });
+    if (!raw) throw new Error('LLM returned no response');
 
-    if (!resp.ok) throw new Error(`Ollama ${resp.status}`);
-    const data = await resp.json();
-    const raw = (data.response || '').trim();
-
-    // Parse JSON from response
-    const arrMatch = raw.match(/\[[\s\S]*\]/);
-    if (!arrMatch) throw new Error('No JSON array in response');
-
-    const assignments = JSON.parse(arrMatch[0]);
-    if (!Array.isArray(assignments)) throw new Error('Not an array');
+    const assignments = parseLenientJson(raw);
+    if (!Array.isArray(assignments)) throw new Error('LLM response is not a JSON array');
 
     // Apply assignments
     for (const assignment of assignments) {
